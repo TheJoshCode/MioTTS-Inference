@@ -3,7 +3,7 @@
 LLAMA_URL="http://localhost:8000"
 
 echo "Starting llama-server..."
-gnome-terminal --title="llama-server" -- bash -c "cd ~/Downloads/llama.cpp/build/bin && ./llama-server -hf Aratako/MioTTS-GGUF -hff MioTTS-1.7B-Q8_0.gguf -c 1024 --cont-batching --batch_size 8 --port 8000"
+gnome-terminal --title="llama-server" -- bash -c "cd ~/Downloads/llama.cpp/build/bin && ./llama-server -hf Aratako/MioTTS-GGUF -hff MioTTS-1.7B-Q6_K.gguf -c 1024 --cont-batching --batch_size 8 --port 8000"
 
 echo "Waiting for llama-server to become healthy..."
 

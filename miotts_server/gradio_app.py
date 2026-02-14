@@ -4,6 +4,8 @@ import base64
 import io
 import os
 import re
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ import httpx
 import numpy as np
 import soundfile as sf
 from pypdf import PdfReader
+from pydub import AudioSegment
 
 DEFAULT_API_BASE = os.getenv("MIOTTS_API_BASE", "http://localhost:8001")
 
@@ -90,7 +93,7 @@ def _call_tts(
     best_of_n_language: str,
 ) -> tuple[tuple[int, np.ndarray] | None, str]:
     if not text:
-        return None, ""
+        return None, "No text provided"
     api_base = api_base.rstrip("/")
 
     payload: dict[str, Any] = {
@@ -118,18 +121,45 @@ def _call_tts(
             "n": best_of_n_n,
             "language": best_of_n_language,
         }
-    response = httpx.post(f"{api_base}/v1/tts", json=payload, timeout=120.0)
+    
+    try:
+        response = httpx.post(f"{api_base}/v1/tts", json=payload, timeout=120.0)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        error_msg = f"HTTP {e.response.status_code}"
+        try:
+            error_detail = e.response.json()
+            if isinstance(error_detail, dict) and "detail" in error_detail:
+                error_msg += f": {error_detail['detail']}"
+        except Exception:
+            pass
+        return None, f"Server error: {error_msg}"
+    except httpx.TimeoutException:
+        return None, "Request timeout (120s). Try shorter text or check server."
+    except httpx.ConnectError:
+        return None, f"Connection error: Cannot reach server at {api_base}"
+    except Exception as e:
+        return None, f"Error: {str(e)}"
 
-    response.raise_for_status()
     content_type = response.headers.get("content-type", "")
     if content_type.startswith("audio/"):
         return _decode_wav_bytes(response.content), ""
-    data = response.json()
+    
+    try:
+        data = response.json()
+    except Exception:
+        return None, "Invalid JSON response from server"
+        
     audio_b64 = data.get("audio")
     if not audio_b64:
         return None, "No audio in response."
-    audio_bytes = base64.b64decode(audio_b64)
-    sr, audio = _decode_wav_bytes(audio_bytes)
+    
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+        sr, audio = _decode_wav_bytes(audio_bytes)
+    except Exception as e:
+        return None, f"Failed to decode audio: {str(e)}"
+        
     audio_samples = audio.shape[0] if hasattr(audio, "shape") else len(audio)
     audio_sec = float(audio_samples) / float(sr) if sr else 0.0
     timings = data.get("timings") or {}
@@ -187,44 +217,156 @@ def _call_tts_batch(
     if not sentences:
         return None, "No sentences to process"
     
+    # Create UUID subfolder for chunks
+    session_id = str(uuid.uuid4())
+    chunks_dir = Path("outs") / session_id
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    
     all_audio = []
     sample_rate = None
     failed = []
+    total_sentences = len(sentences)
+    start_time = time.time()
     
-    for i, sentence in enumerate(progress.tqdm(sentences, desc="Processing sentences")):
-        try:
-            result, _ = _call_tts(
-                api_base=api_base,
-                text=sentence,
-                reference_mode=reference_mode,
-                reference_audio=reference_audio,
-                preset_id=preset_id,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty,
-                best_of_n_enabled=best_of_n_enabled,
-                best_of_n_n=best_of_n_n,
-                best_of_n_language=best_of_n_language,
-            )
-            if result:
-                sr, audio = result
-                if sample_rate is None:
-                    sample_rate = sr
-                all_audio.append(audio)
-        except Exception as e:
-            failed.append(f"Sentence {i+1}: {str(e)}")
+    for i, sentence in enumerate(sentences):
+        # Calculate ETA
+        if i > 0:
+            elapsed = time.time() - start_time
+            avg_time_per_sentence = elapsed / i
+            remaining_sentences = total_sentences - i
+            eta_seconds = avg_time_per_sentence * remaining_sentences
+            eta_mins = int(eta_seconds // 60)
+            eta_secs = int(eta_seconds % 60)
+            eta_str = f"{eta_mins}m {eta_secs}s" if eta_mins > 0 else f"{eta_secs}s"
+            desc = f"Sentence {i+1}/{total_sentences} | ETA: {eta_str}"
+        else:
+            desc = f"Sentence {i+1}/{total_sentences}"
+        
+        # Update progress
+        if progress is not None:
+            progress((i + 1) / total_sentences, desc=desc)
+        
+        # Skip empty sentences
+        if not sentence.strip():
+            continue
+            
+        # Retry logic for failed requests
+        max_retries = 3
+        retry_count = 0
+        success = False
+        
+        while retry_count < max_retries and not success:
+            try:
+                result, _ = _call_tts(
+                    api_base=api_base,
+                    text=sentence,
+                    reference_mode=reference_mode,
+                    reference_audio=reference_audio,
+                    preset_id=preset_id,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    best_of_n_enabled=best_of_n_enabled,
+                    best_of_n_n=best_of_n_n,
+                    best_of_n_language=best_of_n_language,
+                )
+                if result:
+                    sr, audio = result
+                    if sample_rate is None:
+                        sample_rate = sr
+                    elif sr != sample_rate:
+                        # Resample if sample rates don't match (shouldn't happen but just in case)
+                        failed.append(f"Sentence {i+1}: Sample rate mismatch")
+                        break
+                    
+                    # Ensure audio is 1D array
+                    if audio.ndim > 1:
+                        audio = audio.flatten()
+                    
+                    # Save chunk as MP3
+                    chunk_path = chunks_dir / f"chunk_{i+1:03d}.mp3"
+                    try:
+                        # Convert to AudioSegment and export as MP3
+                        audio_int16 = (audio * 32767).astype(np.int16)
+                        audio_segment = AudioSegment(
+                            audio_int16.tobytes(),
+                            frame_rate=sr,
+                            sample_width=2,
+                            channels=1
+                        )
+                        audio_segment.export(str(chunk_path), format="mp3", bitrate="192k")
+                    except Exception as e:
+                        failed.append(f"Sentence {i+1}: Failed to save MP3 - {str(e)[:50]}")
+                    
+                    all_audio.append(audio)
+                    success = True
+                else:
+                    failed.append(f"Sentence {i+1}: No audio returned")
+                    break
+                    
+            except httpx.HTTPStatusError as e:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    error_msg = f"Sentence {i+1}: HTTP {e.response.status_code}"
+                    try:
+                        error_detail = e.response.json()
+                        if isinstance(error_detail, dict) and "detail" in error_detail:
+                            error_msg += f" - {error_detail['detail']}"
+                    except Exception:
+                        pass
+                    failed.append(error_msg)
+                else:
+                    # Wait a bit before retrying
+                    time.sleep(1.0 * retry_count)
+                    
+            except httpx.TimeoutException:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    failed.append(f"Sentence {i+1}: Request timeout")
+                else:
+                    time.sleep(2.0 * retry_count)
+                    
+            except Exception as e:
+                failed.append(f"Sentence {i+1}: {str(e)[:100]}")
+                break
     
     if not all_audio:
-        return None, "All sentences failed to process"
+        error_msg = "All sentences failed to process"
+        if failed:
+            error_msg += ":\n" + "\n".join(failed[:10])  # Show first 10 errors
+            if len(failed) > 10:
+                error_msg += f"\n... and {len(failed) - 10} more errors"
+        return None, error_msg
     
-    # Concatenate all audio
-    combined = np.concatenate(all_audio, axis=0)
+    # Concatenate all audio with silence between sentences (0.3 seconds)
+    silence_duration = 0.3
+    silence_samples = int(sample_rate * silence_duration)
+    silence = np.zeros(silence_samples, dtype=all_audio[0].dtype)
     
-    info = f"Processed {len(all_audio)}/{len(sentences)} sentences successfully"
+    audio_with_pauses = []
+    for i, audio in enumerate(all_audio):
+        audio_with_pauses.append(audio)
+        if i < len(all_audio) - 1:  # Don't add silence after last sentence
+            audio_with_pauses.append(silence)
+    
+    combined = np.concatenate(audio_with_pauses, axis=0)
+    
+    total_time = time.time() - start_time
+    total_mins = int(total_time // 60)
+    total_secs = int(total_time % 60)
+    time_str = f"{total_mins}m {total_secs}s" if total_mins > 0 else f"{total_secs}s"
+    
+    info = f"✓ Successfully processed {len(all_audio)}/{total_sentences} sentences in {time_str}\n"
+    info += f"📁 Chunks saved to: outs/{session_id}/"
     if failed:
-        info += "\n\nFailed sentences:\n" + "\n".join(failed)
+        info += f"\n\n⚠ Failed: {len(failed)} sentences"
+        if len(failed) <= 5:
+            info += "\n" + "\n".join(failed)
+        else:
+            info += "\n" + "\n".join(failed[:5])
+            info += f"\n... and {len(failed) - 5} more errors"
     
     return (sample_rate, combined), info
 
