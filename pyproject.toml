@@ -18,6 +18,7 @@ dependencies = [
     "transformers<5",
     "uvicorn>=0.30.0",
     "ninja>=1.13.0",
+    "pypdf>=6.7.0",
 ]
 
 [project.optional-dependencies]

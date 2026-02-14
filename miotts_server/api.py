@@ -90,10 +90,13 @@ async def list_presets() -> dict[str, Any]:
 
 @app.post("/v1/tts")
 async def tts_json(request: TTSRequest):
-    output_format = _resolve_output_format(request.output, default_format="base64")
-    result = await _run_tts(request, output_format)
-    return result
-
+    try:
+        output_format = _resolve_output_format(request.output, default_format="base64")
+        result = await _run_tts(request, output_format)
+        return result
+    except Exception as e:
+        logging.error(f"TTS Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal TTS error")
 
 @app.post("/v1/tts/file")
 async def tts_file(

@@ -3,14 +3,50 @@ from __future__ import annotations
 import base64
 import io
 import os
+import re
+from pathlib import Path
 from typing import Any
 
 import gradio as gr
 import httpx
 import numpy as np
 import soundfile as sf
+from pypdf import PdfReader
 
 DEFAULT_API_BASE = os.getenv("MIOTTS_API_BASE", "http://localhost:8001")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences using simple regex."""
+    # Split on period, exclamation, question mark followed by space or newline
+    sentences = re.split(r'([.!?]+(?:\s+|$))', text)
+    # Rejoin punctuation with sentences
+    result = []
+    for i in range(0, len(sentences) - 1, 2):
+        sentence = (sentences[i] + sentences[i + 1]).strip()
+        if sentence:
+            result.append(sentence)
+    # Handle last item if odd number of splits
+    if len(sentences) % 2 == 1 and sentences[-1].strip():
+        result.append(sentences[-1].strip())
+    return result
+
+
+def _extract_text_from_file(file_path: str) -> str:
+    """Extract text from txt or pdf files."""
+    path = Path(file_path)
+    
+    if path.suffix.lower() == '.pdf':
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip()
+    elif path.suffix.lower() == '.txt':
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    else:
+        raise ValueError(f"Unsupported file type: {path.suffix}")
 
 
 def _fetch_presets(api_base: str) -> list[str]:
@@ -131,6 +167,68 @@ def _call_tts(
     return (sr, audio), info_text
 
 
+def _call_tts_batch(
+    api_base: str,
+    sentences: list[str],
+    reference_mode: str,
+    reference_audio: tuple[int, np.ndarray] | None,
+    preset_id: str,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+    presence_penalty: float,
+    frequency_penalty: float,
+    best_of_n_enabled: bool,
+    best_of_n_n: int,
+    best_of_n_language: str,
+    progress=gr.Progress(),
+) -> tuple[tuple[int, np.ndarray] | None, str]:
+    """Process multiple sentences and concatenate audio."""
+    if not sentences:
+        return None, "No sentences to process"
+    
+    all_audio = []
+    sample_rate = None
+    failed = []
+    
+    for i, sentence in enumerate(progress.tqdm(sentences, desc="Processing sentences")):
+        try:
+            result, _ = _call_tts(
+                api_base=api_base,
+                text=sentence,
+                reference_mode=reference_mode,
+                reference_audio=reference_audio,
+                preset_id=preset_id,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                best_of_n_enabled=best_of_n_enabled,
+                best_of_n_n=best_of_n_n,
+                best_of_n_language=best_of_n_language,
+            )
+            if result:
+                sr, audio = result
+                if sample_rate is None:
+                    sample_rate = sr
+                all_audio.append(audio)
+        except Exception as e:
+            failed.append(f"Sentence {i+1}: {str(e)}")
+    
+    if not all_audio:
+        return None, "All sentences failed to process"
+    
+    # Concatenate all audio
+    combined = np.concatenate(all_audio, axis=0)
+    
+    info = f"Processed {len(all_audio)}/{len(sentences)} sentences successfully"
+    if failed:
+        info += "\n\nFailed sentences:\n" + "\n".join(failed)
+    
+    return (sample_rate, combined), info
+
+
 def build_app() -> gr.Blocks:
     presets = _fetch_presets(DEFAULT_API_BASE)
 
@@ -144,7 +242,21 @@ def build_app() -> gr.Blocks:
                 placeholder="http://localhost:8001",
             )
 
-        text = gr.Textbox(label="Text", lines=6, placeholder="Type text to synthesize...")
+        with gr.Tabs() as tabs:
+            with gr.Tab("Single Text"):
+                text = gr.Textbox(label="Text", lines=6, placeholder="Type text to synthesize...")
+                
+            with gr.Tab("Batch Processing"):
+                file_upload = gr.File(
+                    label="Upload File (TXT or PDF)",
+                    file_types=[".txt", ".pdf"],
+                )
+                batch_text_preview = gr.Textbox(
+                    label="Extracted Text Preview",
+                    lines=6,
+                    interactive=False,
+                )
+                batch_sentence_count = gr.Markdown("No file loaded")
 
         with gr.Row():
             reference_mode = gr.Radio(
@@ -198,10 +310,33 @@ def build_app() -> gr.Blocks:
                 value="auto",
                 label="Language",
             )
-
-        synth_btn = gr.Button("Synthesize")
+        
+        # Buttons and outputs
+        with gr.Row():
+            synth_btn = gr.Button("Synthesize Single Text", variant="primary")
+            batch_synth_btn = gr.Button("Synthesize Batch", variant="primary")
+        
         output_audio = gr.Audio(label="Output", type="numpy")
         output_info = gr.Markdown(label="Timings")
+
+        # File processing handler
+        def _process_file(file):
+            if file is None:
+                return "", "No file loaded"
+            try:
+                text = _extract_text_from_file(file.name)
+                sentences = _split_sentences(text)
+                preview = text[:500] + ("..." if len(text) > 500 else "")
+                count_info = f"**{len(sentences)} sentences detected**"
+                return preview, count_info
+            except Exception as e:
+                return "", f"Error: {str(e)}"
+
+        file_upload.change(
+            _process_file,
+            inputs=[file_upload],
+            outputs=[batch_text_preview, batch_sentence_count],
+        )
 
         refresh_presets.click(
             _refresh_presets,
@@ -214,6 +349,67 @@ def build_app() -> gr.Blocks:
             inputs=[
                 api_base,
                 text,
+                reference_mode,
+                reference_audio,
+                preset_id,
+                temperature,
+                top_p,
+                repetition_penalty,
+                presence_penalty,
+                frequency_penalty,
+                best_of_n_enabled,
+                best_of_n_n,
+                best_of_n_language,
+            ],
+            outputs=[output_audio, output_info],
+        )
+
+        # Batch synthesis handler
+        def _batch_synthesis(
+            file,
+            api_base_val,
+            ref_mode,
+            ref_audio,
+            preset,
+            temp,
+            topp,
+            rep_pen,
+            pres_pen,
+            freq_pen,
+            bon_enabled,
+            bon_n,
+            bon_lang,
+            progress=gr.Progress(),
+        ):
+            if file is None:
+                return None, "No file uploaded"
+            try:
+                text = _extract_text_from_file(file.name)
+                sentences = _split_sentences(text)
+                return _call_tts_batch(
+                    api_base=api_base_val,
+                    sentences=sentences,
+                    reference_mode=ref_mode,
+                    reference_audio=ref_audio,
+                    preset_id=preset,
+                    temperature=temp,
+                    top_p=topp,
+                    repetition_penalty=rep_pen,
+                    presence_penalty=pres_pen,
+                    frequency_penalty=freq_pen,
+                    best_of_n_enabled=bon_enabled,
+                    best_of_n_n=bon_n,
+                    best_of_n_language=bon_lang,
+                    progress=progress,
+                )
+            except Exception as e:
+                return None, f"Error: {str(e)}"
+
+        batch_synth_btn.click(
+            _batch_synthesis,
+            inputs=[
+                file_upload,
+                api_base,
                 reference_mode,
                 reference_audio,
                 preset_id,

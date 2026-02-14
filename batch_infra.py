@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-MioTTS Batch Processor CLI - Multi-Worker Edition
+MioTTS Batch Processor CLI
 
-A robust command-line tool for batch processing text through MioTTS with
-parallel worker support. Processes chunks concurrently using a worker pool
-while maintaining order for final concatenation.
+A robust command-line tool for batch processing text through MioTTS.
+Processes chunks sequentially while maintaining order for final concatenation.
 """
 
 import argparse
@@ -14,15 +13,10 @@ import os
 import sys
 import time
 import wave
-import io
-import queue
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Union, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, asdict
 import shutil
-from enum import Enum
 
 import requests
 from tqdm import tqdm
@@ -45,13 +39,6 @@ def convert_paths_to_strings(obj):
     elif isinstance(obj, list):
         return [convert_paths_to_strings(item) for item in obj]
     return obj
-
-
-class WorkerState(Enum):
-    IDLE = "idle"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
 
 
 @dataclass
@@ -82,17 +69,92 @@ class TTSConfig:
         return convert_paths_to_strings(d)
 
 
-class TTSWorker:
-    """Individual TTS worker that processes chunks."""
+class MioTTSBatchProcessor:
+    """Main processor for batch TTS processing."""
     
-    def __init__(self, worker_id: int, config: TTSConfig):
-        self.worker_id = worker_id
+    def __init__(self, config: TTSConfig):
         self.config = config
+        self.config.validate()
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json, audio/wav"})
-        self.state = WorkerState.IDLE
-        self.current_chunk = None
         
+        # State tracking
+        self.state = {
+            "processed_indices": [],
+            "failed_indices": [],
+            "output_files": {},
+            "config": config.to_dict()
+        }
+        self.state_file = None
+        
+        self._check_health()
+        
+    def _check_health(self):
+        """Verify API is reachable."""
+        try:
+            resp = requests.get(f"{self.config.api_url}/health", timeout=10)
+            resp.raise_for_status()
+            print(f"✅ API healthy at {self.config.api_url}")
+        except Exception as e:
+            print(f"⚠️  API health check failed: {e}")
+            raise
+    
+    def _load_state(self, state_path: Path):
+        """Load processing state with error handling."""
+        if not state_path.exists():
+            return
+            
+        try:
+            with open(state_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                if not content.strip():
+                    return
+                loaded = json.loads(content)
+            
+            current_config = self.config.to_dict()
+            if loaded.get("config") == current_config:
+                self.state = loaded
+                # Convert output_files dict keys back to int
+                if "output_files" in self.state:
+                    self.state["output_files"] = {
+                        int(k): Path(v) if v else None 
+                        for k, v in self.state["output_files"].items()
+                    }
+                processed = len(self.state.get("processed_indices", []))
+                failed = len(self.state.get("failed_indices", []))
+                print(f"📂 Resuming: {processed} done, {failed} failed")
+            else:
+                print("⚠️  Config changed, starting fresh")
+                backup = state_path.with_suffix('.json.backup')
+                shutil.copy(state_path, backup)
+                
+        except json.JSONDecodeError as e:
+            print(f"⚠️  Corrupted state file: {e}")
+            backup = state_path.with_suffix('.json.corrupted')
+            shutil.move(state_path, backup)
+            print("   Starting fresh")
+        except Exception as e:
+            print(f"⚠️  Error loading state: {e}")
+    
+    def _save_state(self):
+        """Save processing state safely."""
+        if self.state_file:
+            # Convert to serializable format
+            state_to_save = {
+                "processed_indices": self.state["processed_indices"],
+                "failed_indices": self.state["failed_indices"],
+                "output_files": {
+                    str(k): str(v) if v else None 
+                    for k, v in self.state["output_files"].items()
+                },
+                "config": self.state["config"]
+            }
+            try:
+                with open(self.state_file, 'w', encoding='utf-8') as f:
+                    json.dump(state_to_save, f, indent=2, cls=PathEncoder)
+            except Exception as e:
+                print(f"⚠️  Warning: Could not save state: {e}")
+    
     def _get_reference_params(self):
         """Build reference parameters."""
         if self.config.reference_preset:
@@ -145,7 +207,7 @@ class TTSWorker:
                 last_error = e
                 time.sleep((attempt + 1) * 2)
         
-        raise Exception(f"Worker {self.worker_id}: Failed after {retries} attempts: {last_error}")
+        raise Exception(f"Failed after {retries} attempts: {last_error}")
     
     def _make_tts_request_file(self, text: str, retries: int = 3) -> bytes:
         """Make TTS request using file upload API."""
@@ -190,17 +252,14 @@ class TTSWorker:
                     if hasattr(f, 'close'):
                         f.close()
         
-        raise Exception(f"Worker {self.worker_id}: Failed after {retries} attempts: {last_error}")
+        raise Exception(f"Failed after {retries} attempts: {last_error}")
     
-    def process_chunk(self, chunk_idx: int, chunk_text: str, output_path: Path) -> Tuple[int, bool, Optional[Path]]:
+    def _process_chunk(self, chunk_idx: int, chunk_text: str, output_path: Path) -> Tuple[int, bool, Optional[Path]]:
         """
         Process a single chunk.
         
         Returns: (chunk_idx, success, output_path_or_none)
         """
-        self.state = WorkerState.PROCESSING
-        self.current_chunk = chunk_idx
-        
         try:
             if self.config.use_file_upload:
                 audio = self._make_tts_request_file(chunk_text)
@@ -210,122 +269,11 @@ class TTSWorker:
             with open(output_path, 'wb') as f:
                 f.write(audio)
             
-            self.state = WorkerState.COMPLETED
             return (chunk_idx, True, output_path)
             
         except Exception as e:
-            self.state = WorkerState.FAILED
-            print(f"\n❌ Worker {self.worker_id} failed on chunk {chunk_idx}: {e}")
+            print(f"\n❌ Failed on chunk {chunk_idx}: {e}")
             return (chunk_idx, False, None)
-
-
-class MioTTSBatchProcessor:
-    """Main processor with worker pool support."""
-    
-    def __init__(self, config: TTSConfig, num_workers: int = 1):
-        self.config = config
-        self.config.validate()
-        self.num_workers = num_workers
-        
-        # State tracking
-        self.state = {
-            "processed_indices": [],
-            "failed_indices": [],
-            "output_files": {},
-            "config": config.to_dict()
-        }
-        self.state_file = None
-        self.state_lock = threading.Lock()
-        
-        # Progress tracking
-        self.completed_count = 0
-        self.failed_count = 0
-        self.progress_lock = threading.Lock()
-        
-        self._check_health()
-        
-    def _check_health(self):
-        """Verify API is reachable."""
-        try:
-            resp = requests.get(f"{self.config.api_url}/health", timeout=10)
-            resp.raise_for_status()
-            print(f"✅ API healthy at {self.config.api_url}")
-            print(f"🚀 Starting {self.num_workers} worker(s)")
-        except Exception as e:
-            print(f"⚠️  API health check failed: {e}")
-            raise
-    
-    def _load_state(self, state_path: Path):
-        """Load processing state with error handling."""
-        if not state_path.exists():
-            return
-            
-        try:
-            with open(state_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                if not content.strip():
-                    return
-                loaded = json.loads(content)
-            
-            current_config = self.config.to_dict()
-            if loaded.get("config") == current_config:
-                self.state = loaded
-                # Convert output_files dict keys back to int
-                if "output_files" in self.state:
-                    self.state["output_files"] = {
-                        int(k): Path(v) if v else None 
-                        for k, v in self.state["output_files"].items()
-                    }
-                processed = len(self.state.get("processed_indices", []))
-                failed = len(self.state.get("failed_indices", []))
-                print(f"📂 Resuming: {processed} done, {failed} failed")
-            else:
-                print("⚠️  Config changed, starting fresh")
-                backup = state_path.with_suffix('.json.backup')
-                shutil.copy(state_path, backup)
-                
-        except json.JSONDecodeError as e:
-            print(f"⚠️  Corrupted state file: {e}")
-            backup = state_path.with_suffix('.json.corrupted')
-            shutil.move(state_path, backup)
-            print("   Starting fresh")
-        except Exception as e:
-            print(f"⚠️  Error loading state: {e}")
-    
-    def _save_state(self):
-        """Save processing state safely."""
-        if self.state_file:
-            with self.state_lock:
-                # Convert to serializable format
-                state_to_save = {
-                    "processed_indices": self.state["processed_indices"],
-                    "failed_indices": self.state["failed_indices"],
-                    "output_files": {
-                        str(k): str(v) if v else None 
-                        for k, v in self.state["output_files"].items()
-                    },
-                    "config": self.state["config"]
-                }
-                try:
-                    with open(self.state_file, 'w', encoding='utf-8') as f:
-                        json.dump(state_to_save, f, indent=2, cls=PathEncoder)
-                except Exception as e:
-                    print(f"⚠️  Warning: Could not save state: {e}")
-    
-    def _update_progress(self, chunk_idx: int, success: bool, output_path: Optional[Path]):
-        """Thread-safe progress update."""
-        with self.progress_lock:
-            if success:
-                self.completed_count += 1
-                self.state["processed_indices"].append(chunk_idx)
-                self.state["output_files"][chunk_idx] = output_path
-            else:
-                self.failed_count += 1
-                self.state["failed_indices"].append(chunk_idx)
-            
-            # Save state periodically
-            if (self.completed_count + self.failed_count) % 5 == 0:
-                self._save_state()
     
     def _split_text(self, text: str, mode: str = "line", max_chars: Optional[int] = None) -> List[str]:
         """Split text into processing chunks."""
@@ -415,7 +363,7 @@ class MioTTSBatchProcessor:
         delete_chunks: bool = False,
         on_error: str = "prompt"
     ) -> Optional[Path]:
-        """Process file with worker pool."""
+        """Process file sequentially."""
         input_path = Path(input_path)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -441,58 +389,43 @@ class MioTTSBatchProcessor:
         
         # Determine which chunks remain
         processed_set = set(self.state["processed_indices"])
-        failed_set = set(self.state["failed_indices"])
         remaining = [(i, chunks[i]) for i in range(total) if i not in processed_set]
         
         print(f"\n📚 {input_path.name}")
         print(f"   Mode: {split_mode} | Total: {total} | Remaining: {len(remaining)}")
-        print(f"   Workers: {self.num_workers} | Output: {output_dir}")
+        print(f"   Output: {output_dir}")
         print(f"   Ref: {self.config.reference_preset or self.config.reference_audio}\n")
         
         if not remaining:
             print("✅ All chunks already processed!")
         
-        # Create workers
-        workers = [TTSWorker(i, self.config) for i in range(self.num_workers)]
+        # Process with progress bar
+        pbar = tqdm(remaining, desc="Processing", unit="chunk")
         
-        # Progress bar
-        pbar = tqdm(total=len(remaining), desc="Processing", unit="chunk")
-        
-        # Process with thread pool
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit all tasks
-            future_to_chunk = {}
-            for chunk_idx, chunk_text in remaining:
-                # Skip empty
-                if not chunk_text.strip():
-                    self.state["processed_indices"].append(chunk_idx)
-                    continue
-                
-                output_path = chunks_dir / f"{job_name}_{chunk_idx:05d}.wav"
-                worker = workers[len(future_to_chunk) % self.num_workers]
-                
-                future = executor.submit(worker.process_chunk, chunk_idx, chunk_text, output_path)
-                future_to_chunk[future] = (chunk_idx, chunk_text, output_path)
+        for chunk_idx, chunk_text in pbar:
+            # Skip empty
+            if not chunk_text.strip():
+                self.state["processed_indices"].append(chunk_idx)
+                continue
             
-            # Process completed tasks as they finish
-            for future in as_completed(future_to_chunk):
-                chunk_idx, chunk_text, output_path = future_to_chunk[future]
+            output_path = chunks_dir / f"{job_name}_{chunk_idx:05d}.wav"
+            
+            idx, success, path = self._process_chunk(chunk_idx, chunk_text, output_path)
+            
+            if success:
+                self.state["processed_indices"].append(idx)
+                self.state["output_files"][idx] = path
+            else:
+                self.state["failed_indices"].append(idx)
                 
-                try:
-                    idx, success, path = future.result()
-                    self._update_progress(idx, success, path)
-                    
-                    if not success and on_error == "prompt":
-                        choice = input(f"\nChunk {idx} failed. [c]ontinue, [s]top? ").lower()
-                        if choice == 's':
-                            executor.shutdown(wait=False)
-                            raise KeyboardInterrupt
-                            
-                except Exception as e:
-                    print(f"\n❌ Exception in chunk {chunk_idx}: {e}")
-                    self._update_progress(chunk_idx, False, None)
-                
-                pbar.update(1)
+                if on_error == "prompt":
+                    choice = input(f"\nChunk {idx} failed. [c]ontinue, [s]top? ").lower()
+                    if choice == 's':
+                        raise KeyboardInterrupt
+            
+            # Save state periodically
+            if len(self.state["processed_indices"]) % 5 == 0:
+                self._save_state()
         
         pbar.close()
         self._save_state()
@@ -521,32 +454,23 @@ class MioTTSBatchProcessor:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MioTTS Batch Processor - Multi-Worker Edition",
+        description="MioTTS Batch Processor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Single worker (default)
+  # Basic usage
   python miotts_batch.py book.txt -o ./out/
   
-  # 4 parallel workers (4x faster)
-  python miotts_batch.py book.txt -o ./out/ --workers 4
+  # Paragraph splitting
+  python miotts_batch.py book.txt -o ./out/ --split paragraph
   
-  # 8 workers with paragraph splitting
-  python miotts_batch.py book.txt -o ./out/ --workers 8 --split paragraph
-  
-  # Custom reference with 2 workers
-  python miotts_batch.py book.txt --reference-audio ./voice.wav -o ./out/ -w 2
+  # Custom reference
+  python miotts_batch.py book.txt --reference-audio ./voice.wav -o ./out/
         """
     )
     
     parser.add_argument("input", help="Input text file")
     parser.add_argument("-o", "--output", required=True, help="Output directory")
-    
-    # Worker configuration
-    parser.add_argument("-w", "--workers", type=int, default=1,
-                       help="Number of parallel workers (default: 1)")
-    parser.add_argument("--max-workers", type=int, default=8,
-                       help="Maximum allowed workers (safety limit)")
     
     # Voice selection
     voice_group = parser.add_mutually_exclusive_group()
@@ -577,14 +501,6 @@ Examples:
     
     args = parser.parse_args()
     
-    # Validate workers
-    if args.workers < 1:
-        print("Error: Workers must be at least 1")
-        sys.exit(1)
-    if args.workers > args.max_workers:
-        print(f"Error: Workers capped at {args.max_workers} for safety")
-        args.workers = args.max_workers
-    
     config = TTSConfig(
         api_url=args.api_url,
         reference_preset=args.preset if not args.reference_audio else None,
@@ -595,7 +511,7 @@ Examples:
         use_file_upload=args.use_file_upload
     )
     
-    processor = MioTTSBatchProcessor(config, num_workers=args.workers)
+    processor = MioTTSBatchProcessor(config)
     
     try:
         processor.process_file(
