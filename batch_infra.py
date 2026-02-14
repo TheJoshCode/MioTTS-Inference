@@ -27,6 +27,8 @@ from enum import Enum
 import requests
 from tqdm import tqdm
 
+import subprocess
+import tempfile
 
 class PathEncoder(json.JSONEncoder):
     """JSON Encoder that handles Path objects."""
@@ -106,47 +108,50 @@ class TTSWorker:
                 return {"type": "base64", "data": data}
         return {}
     
-    def _make_tts_request_json(self, text: str, retries: int = 3) -> bytes:
-        """Make TTS request using JSON API."""
+    def _make_tts_request_json(self, text: str) -> bytes:
         payload = {
             "text": text,
-            "reference": self._get_reference_params(),
-            "llm": {
-                "temperature": self.config.temperature,
-                "top_p": self.config.top_p,
-                "max_tokens": self.config.max_tokens,
-                "repetition_penalty": self.config.repetition_penalty,
-                "presence_penalty": self.config.presence_penalty,
-                "frequency_penalty": self.config.frequency_penalty
-            },
-            "output": {"format": "base64"}
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "max_tokens": self.config.max_tokens,
+            "repetition_penalty": self.config.repetition_penalty,
+            "presence_penalty": self.config.presence_penalty,
+            "frequency_penalty": self.config.frequency_penalty,
+            "output_format": "base64"
         }
-        
+
+        if self.config.reference_preset:
+            payload["reference_preset_id"] = self.config.reference_preset
+        elif self.config.reference_audio:
+            with open(self.config.reference_audio, "rb") as f:
+                payload["reference_audio_base64"] = base64.b64encode(f.read()).decode()
+
         if self.config.best_of_n_enabled:
-            payload["best_of_n"] = {
-                "enabled": True,
-                "n": self.config.best_of_n_n,
-                "language": self.config.best_of_n_language
-            }
-        
-        last_error = None
-        for attempt in range(retries):
+            payload["best_of_n_enabled"] = True
+            payload["best_of_n_n"] = self.config.best_of_n_n
+            payload["best_of_n_language"] = self.config.best_of_n_language
+
+        attempt = 0
+        while True:
             try:
                 resp = self.session.post(
                     f"{self.config.api_url}/v1/tts",
                     json=payload,
                     timeout=120
                 )
+                if not resp.ok:
+                    print(resp.text)
                 resp.raise_for_status()
+
                 data = resp.json()
                 return base64.b64decode(data["audio"])
-                
+
             except Exception as e:
-                last_error = e
-                time.sleep((attempt + 1) * 2)
-        
-        raise Exception(f"Worker {self.worker_id}: Failed after {retries} attempts: {last_error}")
-    
+                attempt += 1
+                wait = min(10, attempt * 2)
+                print(f"⚠️ Worker {self.worker_id} retrying (attempt {attempt}) in {wait}s: {e}")
+                time.sleep(wait)
+
     def _make_tts_request_file(self, text: str, retries: int = 3) -> bytes:
         """Make TTS request using file upload API."""
         files = {}
@@ -207,9 +212,23 @@ class TTSWorker:
             else:
                 audio = self._make_tts_request_json(chunk_text)
             
-            with open(output_path, 'wb') as f:
-                f.write(audio)
-            
+            """with open(output_path, 'wb') as f:
+                f.write(audio)"""
+            # Write temp wav
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+                tmp_wav.write(audio)
+                tmp_wav_path = tmp_wav.name
+
+            # Convert to mp3
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", tmp_wav_path,
+                "-codec:a", "libmp3lame",
+                "-qscale:a", "2",
+                str(output_path)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            os.remove(tmp_wav_path)
             self.state = WorkerState.COMPLETED
             return (chunk_idx, True, output_path)
             
@@ -341,7 +360,7 @@ class MioTTSBatchProcessor:
             chunks = [s.strip() for s in sentences if s.strip()]
         elif mode == "chunk":
             if not max_chars:
-                max_chars = 300
+                max_chars = 9999999999999
             chunks = []
             words = text.split()
             current = ""
@@ -403,7 +422,42 @@ class MioTTSBatchProcessor:
                 w.writeframes(frame)
         
         print(f"✅ Final: {output_path}")
-    
+
+    def _concatenate_mp3(self, mp3_files: Dict[int, Path], output_path: Path):
+        if not mp3_files:
+            return
+
+        sorted_indices = sorted(mp3_files.keys())
+        sorted_files = [
+            mp3_files[i] for i in sorted_indices
+            if mp3_files[i] and mp3_files[i].exists()
+        ]
+
+        if not sorted_files:
+            print("⚠️ No valid files to concatenate")
+            return
+
+        print(f"\n🔧 Concatenating {len(sorted_files)} MP3 segments...")
+
+        # Create file list for ffmpeg
+        list_file = output_path.parent / "concat_list.txt"
+        with open(list_file, "w") as f:
+            for mp3 in sorted_files:
+                f.write(f"file '{mp3.resolve()}'\n")
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_file),
+            "-c", "copy",
+            str(output_path)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        list_file.unlink(missing_ok=True)
+
+        print(f"✅ Final MP3: {output_path}")
+
     def process_file(
         self,
         input_path: Path,
@@ -468,7 +522,8 @@ class MioTTSBatchProcessor:
                     self.state["processed_indices"].append(chunk_idx)
                     continue
                 
-                output_path = chunks_dir / f"{job_name}_{chunk_idx:05d}.wav"
+                #output_path = chunks_dir / f"{job_name}_{chunk_idx:05d}.wav"
+                output_path = chunks_dir / f"{job_name}_{chunk_idx:05d}.mp3"
                 worker = workers[len(future_to_chunk) % self.num_workers]
                 
                 future = executor.submit(worker.process_chunk, chunk_idx, chunk_text, output_path)
@@ -482,11 +537,11 @@ class MioTTSBatchProcessor:
                     idx, success, path = future.result()
                     self._update_progress(idx, success, path)
                     
-                    if not success and on_error == "prompt":
+                    """if not success and on_error == "prompt":
                         choice = input(f"\nChunk {idx} failed. [c]ontinue, [s]top? ").lower()
                         if choice == 's':
                             executor.shutdown(wait=False)
-                            raise KeyboardInterrupt
+                            raise KeyboardInterrupt"""
                             
                 except Exception as e:
                     print(f"\n❌ Exception in chunk {chunk_idx}: {e}")
@@ -500,9 +555,11 @@ class MioTTSBatchProcessor:
         # Concatenate results
         final_output = None
         if concatenate and self.state["output_files"]:
-            final_output = output_dir / f"{job_name}_complete.wav"
-            self._concatenate_wavs(self.state["output_files"], final_output, add_silence_ms)
-            
+            #final_output = output_dir / f"{job_name}_complete.wav"
+            #self._concatenate_wavs(self.state["output_files"], final_output, add_silence_ms)
+            final_output = output_dir / f"{job_name}_complete.mp3"
+            self._concatenate_mp3(self.state["output_files"], final_output)
+
             if delete_chunks:
                 print("🗑️  Cleaning up chunks...")
                 for path in self.state["output_files"].values():

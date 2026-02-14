@@ -17,11 +17,9 @@ do
 done
 
 echo "llama-server is up."
-
-gnome-terminal --title="run_server.py" -- bash -c "source .venv/bin/activate && python run_server.py --llm-base-url http://localhost:8000/v1"
-sleep 2
-#gnome-terminal --title="gradio" -- bash -c "source .venv/bin/activate && python run_gradio.py"
 sleep 1
-gnome-terminal --title="nvidia-smi" -- bash -c "watch -n 0.5 nvidia-smi"
+gnome-terminal --title="run_server.py" -- bash -c "source .venv/bin/activate && python run_server.py --llm-base-url http://localhost:8000/v1"
+sleep 1
+gnome-terminal --title="gradio" -- bash -c "source .venv/bin/activate && python run_gradio.py"
 sleep 7
-gnome-terminal --title="batch_infra" -- bash -c "source .venv/bin/activate && python batch_infra.py kjv.txt --reference-audio ./mf.wav -o ./out/ --workers 4"
+gnome-terminal --title="batch_infra" -- bash -c "source .venv/bin/activate && python batch_infra.py kjv.txt --reference-audio ./mf.wav -o ./out/ --use-file-upload --workers 8"
